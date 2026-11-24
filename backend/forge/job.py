@@ -21,6 +21,8 @@ or the network is injected.
 import hashlib
 import json
 import os
+import re
+import sys
 import threading
 
 from . import inventory, sanity, space
@@ -91,7 +93,8 @@ class Job:
         return {"version": 1, "fingerprint": fp, "req": self.req, "stage": "fit",
                 "phase": "plain", "cands": [], "rejected": [], "rows": {}, "failed": {}, "tokens": {},
                 "finalists": [], "rows_b": {}, "sanity": {}, "result": None,
-                "error": None, "current": None, "started_at": self._now(), "finished_at": None}
+                "error": None, "current": None, "started_at": self._now(), "finished_at": None,
+                "candidates_tested": 0}
 
     def _open(self):
         fp = _fingerprint(self.inv, self.req)
@@ -106,6 +109,12 @@ class Job:
         return self._fresh(fp)
 
     def save(self):
+        if self.state and self.state.get("stage") not in ("done", "cancelled", "error"):
+            started = self.state.get("started_at")
+            if started:
+                now = self._now()
+                if now:
+                    self.state["elapsed_seconds"] = now - started
         tmp = self.path + ".tmp"
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
@@ -158,6 +167,7 @@ class Job:
             rnd, toks = out
             self.state["rows"][cand["id"]] = self._row(cand, rnd, load)
             self.state["tokens"][cand["id"]] = toks
+        self.state["candidates_tested"] = self.state.get("candidates_tested", 0) + 1
         self.save()
 
     def _stage_b(self, cand):
@@ -172,6 +182,7 @@ class Job:
             self.state["rows_b"][cand["id"]] = self._row(cand, out, load)
         else:
             self.state["failed"][cand["id"]] = f"round B: {out}"
+        self.state["candidates_tested"] = self.state.get("candidates_tested", 0) + 1
         self.save()
 
     # ---------------------------------------------------------- stages
@@ -179,16 +190,29 @@ class Job:
         """Prune and queue candidates not seen before."""
         st = self.state
         seen = {c["id"] for c in st["cands"]} | {r["id"] for r in st["rejected"]}
+        # Apply MoE cache settings to all candidates if tuned
+        moe_settings = st.get("moe_tuned")
+        if moe_settings:
+            cands = [self._with_moe_settings(c, moe_settings) for c in cands]
         keep, rejected = space.prune([c for c in cands if c["id"] not in seen],
                                      self._estimate, self.inv.get("gpus") or [])
         st["cands"] += keep
         st["rejected"] += rejected
+
+    def _with_moe_settings(self, cand, moe_settings):
+        """Add MoE cache settings to a candidate."""
+        settings = dict(cand["settings"])
+        settings.update(moe_settings)
+        return {**cand, "settings": settings}
 
     def _plan(self):
         st = self.state
         if st["cands"]:
             return
         base = dict(self.inv.get("base") or {})
+        # Apply MoE settings to current setup too
+        if st.get("moe_tuned"):
+            base = dict(base, **st["moe_tuned"])
         st["cands"] = [{"id": CURRENT, "label": "your current setup", "settings": base,
                         "lossy": False, "parts": 1, "spec": _drafts_with(base),
                         "ctx": int(base.get("ctx-size") or 0) or None}]
@@ -278,6 +302,105 @@ class Job:
             st["sanity"][fid] = r
         self.save()
 
+    def _is_moe_model(self):
+        """Check if the model is an MoE model by inspecting tensor names."""
+        layout = None
+        model_path = self.inv.get("base", {}).get("model", "")
+        if model_path:
+            try:
+                import gguf
+                layout = gguf.layout(model_path)
+            except Exception:
+                layout = None
+        if not layout:
+            return False
+        exps_re = re.compile(r"\.ffn_(up|down|gate|gate_up)_(ch|)exps")
+        return any(exps_re.search(t[0]) for t in layout.get("tensors", []))
+
+    def _moe_tune(self):
+        """Run MoE cache tuning before benchmarking. Returns tuned settings or None."""
+        if not self._is_moe_model():
+            return None
+
+        st = self.state
+        st["stage"] = "moe-tune"
+        self.save()
+
+        try:
+            import prebuilt
+            import config
+            import subprocess
+
+            c = config.load()
+            sbin = c.get("server_bin", "")
+            if not sbin:
+                return None
+
+            # Find the install directory for the active server binary
+            installs = prebuilt.list_installs(
+                os.path.join(os.environ.get("HOME", "/tmp"), "Github", "LlamaForge", "engines", "llama.cpp"),
+                active_bin=sbin
+            )
+            install_dir = None
+            for inst in installs:
+                if inst.get("active") or inst.get("server_bin") == sbin:
+                    install_dir = inst["dir"]
+                    break
+            if not install_dir and installs:
+                install_dir = installs[0]["dir"]
+            if not install_dir:
+                return None
+
+            # Get or download the tuning script
+            script = os.path.join(install_dir, "scripts", "moe-cache-tune.py")
+            if not os.path.isfile(script):
+                script = prebuilt.download_moe_cache_script(install_dir)
+            if not script or not os.path.isfile(script):
+                return None
+
+            # Build the llama-server command for tuning
+            base = dict(self.inv.get("base") or {})
+            model = base.get("model", "")
+            if not model:
+                return None
+
+            # Use a simple placement for tuning (full GPU offload)
+            tune_cmd = [sbin, "-m", model, "-cmoe", "-ngl", "999"]
+
+            # Run the tuning script
+            out_dir = os.path.join(os.path.dirname(self.path), "moe-tune")
+            result = subprocess.run(
+                [sys.executable, script, "--out", out_dir, "--"] + tune_cmd,
+                capture_output=True, text=True, timeout=600
+            )
+
+            # Parse the recommended settings from output
+            for line in result.stdout.split("\n"):
+                if "recommended:" in line:
+                    # Extract --moe-cache-mib N and --moe-cache-cpu-share F
+                    mib_match = re.search(r"--moe-cache-mib\s+(\d+)", line)
+                    share_match = re.search(r"--moe-cache-cpu-share\s+([\d.]+)", line)
+                    if mib_match:
+                        settings = {"moe-cache-mib": int(mib_match.group(1))}
+                        if share_match:
+                            settings["moe-cache-cpu-share"] = float(share_match.group(1))
+                        st["moe_tuned"] = settings
+                        st["moe_tune_note"] = line.strip()
+                        self.save()
+                        return settings
+                    break
+
+            st["moe_tuned"] = None
+            st["moe_tune_note"] = "Tuning ran but no recommendation found"
+            self.save()
+            return None
+
+        except Exception as e:
+            st["moe_tuned"] = None
+            st["moe_tune_error"] = str(e)
+            self.save()
+            return None
+
     def _result(self):
         st = self.state
         rows = [r for i, r in st["rows_b"].items()
@@ -316,6 +439,9 @@ class Job:
             st = self.state
             try:
                 with self._lease():
+                    # Tune MoE cache settings before benchmarking
+                    if not st.get("moe_tuned"):
+                        self._moe_tune()
                     self._plan()
                     st["stage"] = "fit"
                     self._fit_pending()

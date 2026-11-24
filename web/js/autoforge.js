@@ -37,6 +37,15 @@ export function pct(v) {
   const n = Math.round(+v);
   return n === 0 ? "same" : (n > 0 ? `+${n}%` : `${n}%`);
 }
+function formatTime(seconds) {
+  if (seconds == null || !Number.isFinite(+seconds)) return "–";
+  const s = Math.round(+seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return `${m}:${String(sec).padStart(2, "0")}`;
+}
 
 export function setupMarkup(id, req = {}) {
   const intent = req.intent || "coding", ctx = +req.ctx || 32768;
@@ -119,10 +128,17 @@ export function liveMarkup(id, st) {
   const p = st.progress || {};
   const stage = STAGE[st.stage] ?? st.stage;
   const bar = p.total ? Math.round(100 * p.done / p.total) : 0;
+  const elapsed = formatTime(st.elapsed_seconds);
+  const eta = st.estimated_remaining != null ? formatTime(st.estimated_remaining) : null;
+  const progressInfo = [
+    `<span class="af-count">${esc(p.done ?? 0)}/${esc(p.total ?? 0)}</span>`,
+    `<span class="af-elapsed" title="elapsed time">⏱ ${esc(elapsed)}</span>`,
+    eta ? `<span class="af-eta" title="estimated time remaining">~${esc(eta)} left</span>` : ""
+  ].filter(Boolean).join(" ");
   const head = st.running
     ? `<div class="af-live"><span class="af-stage">${esc(stage)}${st.loading ? ` · loading ${esc(st.loading)}` : ""}</span>
         <span class="lbar" role="progressbar" aria-label="Auto-Forge progress" aria-valuenow="${bar}" aria-valuemin="0" aria-valuemax="100"><i style="width:${bar}%"></i></span>
-        <span class="af-count">${esc(p.done ?? 0)}/${esc(p.total ?? 0)}</span>
+        ${progressInfo}
         <button type="button" class="qbtn stop" data-af-cancel="${esc(id)}">Cancel</button></div>`
     : (st.error ? `<div class="af-result bad">${esc(stage)}: ${esc(st.error)}</div>` : "");
   return head + resultMarkup(id, st) + boardMarkup(st);

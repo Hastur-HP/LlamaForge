@@ -85,7 +85,7 @@ class Summary(unittest.TestCase):
 
     def test_progress_and_leaderboard(self):
         s = report.summary(self.state(), running=True)
-        self.assertEqual(s["progress"], {"done": 2, "total": 4})
+        self.assertEqual(s["progress"], {"done": 2, "total": 4, "candidates_tested": 0})
         self.assertEqual(s["loading"], "B")
         self.assertEqual([r["id"] for r in s["leaderboard"]], ["a", "current"])
         self.assertEqual(s["rejected"][0]["reason"], "needs 20 GB")

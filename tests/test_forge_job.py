@@ -125,8 +125,9 @@ class JobRun(unittest.TestCase):
     def test_a_no_vision_winner_says_so(self):
         # the projector costs GPU0 room: without it the drafted solo setup fits
         vis = dict(INV, base=dict(INV["base"], mmproj="/m/mmproj.gguf"))
-        rig = Rig(fail=lambda s: "out of memory" if s.get("mmproj") and "spec-draft-model" in s
-                  and s.get("device") == "CUDA0" else None)
+        # Fail on any CUDA0 config with mmproj (regardless of speculative drafting)
+        rig = Rig(fail=lambda s: "out of memory" if s.get("mmproj") and s.get("device") == "CUDA0"
+                  else None)
         st = rig.job(self.path, inv=vis, req=dict(REQ, drop_vision=True)).run()
         win = st["result"]["winner"]
         self.assertNotIn("mmproj", win["settings"])
@@ -315,6 +316,51 @@ class JobRun(unittest.TestCase):
         rig.on_bench = nested
         rig.job(self.path).run()
         self.assertIsInstance(inner.get("err"), job.Busy)
+
+    def test_moe_model_detection(self):
+        rig = Rig()
+        j = rig.job(self.path)
+        self.assertFalse(j._is_moe_model())
+
+    def test_with_moe_settings_applies_to_candidate(self):
+        rig = Rig()
+        j = rig.job(self.path)
+        cand = {
+            "id": "test",
+            "settings": {"device": "CUDA0"},
+            "label": "test",
+            "lossy": False,
+            "parts": 1,
+            "spec": None,
+            "ctx": None
+        }
+        moe_settings = {"moe-cache-mib": 1024, "moe-cache-cpu-share": 0.9}
+        result = j._with_moe_settings(cand, moe_settings)
+        self.assertEqual(result["settings"]["moe-cache-mib"], 1024)
+        self.assertEqual(result["settings"]["moe-cache-cpu-share"], 0.9)
+        # Original unchanged
+        self.assertNotIn("moe-cache-mib", cand["settings"])
+
+    def test_moe_settings_applied_during_benchmarking(self):
+        """MoE cache settings are applied to all candidates when tuned."""
+        rig = Rig()
+        j = rig.job(self.path)
+        j.state = j._fresh("test")
+        j.state["moe_tuned"] = {"moe-cache-mib": 2048, "moe-cache-cpu-share": 0.95}
+
+        # Add candidates with MoE settings
+        test_cands = [
+            {"id": "c1", "settings": {"device": "CUDA0"}, "label": "c1", "lossy": False, "parts": 1, "spec": None, "ctx": None},
+            {"id": "c2", "settings": {"device": "CUDA1"}, "label": "c2", "lossy": False, "parts": 1, "spec": None, "ctx": None}
+        ]
+        j._add(test_cands)
+
+        # Verify MoE settings were applied
+        for c in j.state["cands"]:
+            self.assertIn("moe-cache-mib", c["settings"])
+            self.assertEqual(c["settings"]["moe-cache-mib"], 2048)
+            self.assertIn("moe-cache-cpu-share", c["settings"])
+            self.assertEqual(c["settings"]["moe-cache-cpu-share"], 0.95)
 
 
 if __name__ == "__main__":

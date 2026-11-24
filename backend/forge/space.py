@@ -33,6 +33,8 @@ _FLAGS = {
     "draft_n_max": ("--spec-draft-n-max", "--draft-max", "--draft-n-max"),
     "ubatch": ("--ubatch-size",),
     "batch": ("--batch-size",),
+    "threads": ("--threads",),
+    "kv_offload": ("--kv-offload",),
 }
 
 # drafter kind -> (spec-type value, default window, quick windows, thorough windows)
@@ -110,19 +112,29 @@ def _ratio(vrams, off):
 
 
 def placements(gpus, caps, steps=STEPS_QUICK):
-    """[{name, settings, devices}] - where the weights go. Every placement asks for
-    full offload; a model that doesn't fit should fail loudly, not crawl."""
+    """[{name, settings, devices}] - where the weights go. Tries full offload first,
+    then progressively less GPU offload so models that don't fit entirely can still
+    run with partial CPU offload."""
     if not gpus:
         return []
     k = caps["keys"]
-    ngl = {(k["ngl"] or "n-gpu-layers"): "999"}
+    ngl_key = k["ngl"] or "n-gpu-layers"
+    # Try full offload, then progressively less GPU offload so models that don't
+    # fit entirely can still run with partial CPU offload. Granular low values
+    # catch optimal offload points like 44 layers (between 50 and 25).
+    ngl_values = ["999", "500", "250", "150", "100", "75", "50", "25", "10", "0"]
     if len(gpus) == 1:
-        return [{"name": "gpu", "settings": dict(ngl), "devices": [gpus[0]["index"]]}]
+        out = []
+        for ngl in ngl_values:
+            out.append({"name": f"gpu-{ngl}", "settings": {ngl_key: ngl},
+                        "devices": [gpus[0]["index"]]})
+        return out
     out = []
     if k["device"] and "none" in caps["split_modes"]:
         for g in gpus:
-            s = dict(ngl, **{k["split_mode"]: "none", k["device"]: device_name(g)})
-            out.append({"name": f"solo{g['index']}", "settings": s, "devices": [g["index"]]})
+            for ngl in ngl_values:
+                s = {ngl_key: ngl, k["split_mode"]: "none", k["device"]: device_name(g)}
+                out.append({"name": f"solo{g['index']}-{ngl}", "settings": s, "devices": [g["index"]]})
     if k["tensor_split"]:
         modes = [m for m in caps["split_modes"] if m != "none"] or [None]
         vrams = [g.get("vram_mib") or 1 for g in gpus]
@@ -133,11 +145,12 @@ def placements(gpus, caps, steps=STEPS_QUICK):
                 ratios.append(r)
         for mode in modes:
             for r in ratios:
-                s = dict(ngl, **{k["tensor_split"]: r})
-                if mode:
-                    s[k["split_mode"]] = mode
-                out.append({"name": f"{mode or 'split'}{r}", "settings": s,
-                            "devices": [g["index"] for g in gpus]})
+                for ngl in ngl_values:
+                    s = {ngl_key: ngl, k["tensor_split"]: r}
+                    if mode:
+                        s[k["split_mode"]] = mode
+                    out.append({"name": f"{mode or 'split'}{r}-{ngl}", "settings": s,
+                                "devices": [g["index"] for g in gpus]})
     return out
 
 
@@ -204,10 +217,35 @@ def _vision_options(base, drop):
     return out
 
 
+def _thread_options(caps):
+    """[(threads)] - thread count candidates based on CPU core count.
+    Uses physical core count and explores half, equal, and double for
+    hyperthreading scenarios. Caps at reasonable values."""
+    k = caps["keys"]
+    if not k["threads"]:
+        return [None]
+    try:
+        cores = os.cpu_count() or 4
+    except Exception:
+        cores = 4
+    # Explore half, equal, and double for hyperthreading
+    candidates = set()
+    candidates.add(cores)
+    candidates.add(max(1, cores // 2))
+    candidates.add(min(cores * 2, 64))
+    # Add some fixed reasonable values
+    for n in (4, 8, 12, 16, 24, 32):
+        if n <= 64:
+            candidates.add(n)
+    # Filter to reasonable range 1-64
+    result = sorted(n for n in candidates if 1 <= n <= 64)
+    return [n for n in result]
+
+
 def candidates(inv, req, drafters=True):
-    """Fit-level candidates: placement x drafter (and where it runs) x KV types, at the
-    requested context. Draft windows are expanded later (spec_variants) - they don't
-    change memory, so the fit stage needn't load each one. drafters=False: plain
+    """Fit-level candidates: placement x drafter (and where it runs) x KV types x threads,
+    at the requested context. Draft windows are expanded later (spec_variants) - they
+    don't change memory, so the fit stage needn't load each one. drafters=False: plain
     placements only (the staged search adds drafters to the best of them)."""
     caps = inv["caps"]
     k = caps["keys"]
@@ -215,22 +253,26 @@ def candidates(inv, req, drafters=True):
     base = {key: v for key, v in (inv.get("base") or {}).items() if key not in owned}
     steps = STEPS_THOROUGH if req.get("time") == "thorough" else STEPS_QUICK
     out = []
+    threads = _thread_options(caps)
     for vbase, novision in _vision_options(base, req.get("drop_vision")):
         for p in placements(inv.get("gpus") or [], caps, steps):
             for kind, dset in (_drafter_options(inv, caps) if drafters else [(None, {})]):
                 for ck, cv, lossy in _kv_options(inv.get("base") or {}, caps, req.get("allow_loss")):
-                    s = dict(vbase)
-                    s.update(p["settings"])
-                    s["ctx-size"] = str(req["ctx"])
-                    if k["fit"]:
-                        s[k["fit"]] = "off"     # a silent fit-down would fake a pass
-                    s[k["ctk"] or "cache-type-k"] = ck
-                    s[k["ctv"] or "cache-type-v"] = cv
-                    s.update(dset)
-                    out.append({"id": _cid(s), "label": label(s, inv.get("gpus") or [], novision),
-                                "settings": s, "lossy": lossy, "novision": novision,
-                                "ctx": int(req["ctx"]), "devices": p["devices"], "spec": kind,
-                                "parts": len(p["devices"]) + (1 if kind else 0)})
+                    for t in threads:
+                        s = dict(vbase)
+                        s.update(p["settings"])
+                        s["ctx-size"] = str(req["ctx"])
+                        if k["fit"]:
+                            s[k["fit"]] = "off"     # a silent fit-down would fake a pass
+                        s[k["ctk"] or "cache-type-k"] = ck
+                        s[k["ctv"] or "cache-type-v"] = cv
+                        if t is not None:
+                            s[k["threads"]] = str(t)
+                        s.update(dset)
+                        out.append({"id": _cid(s), "label": label(s, inv.get("gpus") or [], novision),
+                                    "settings": s, "lossy": lossy, "novision": novision,
+                                    "ctx": int(req["ctx"]), "devices": p["devices"], "spec": kind,
+                                    "parts": len(p["devices"]) + (1 if kind else 0)})
     return out
 
 
@@ -367,7 +409,7 @@ def _kv_words(k, v):
 
 
 def label(s, gpus, novision=False):
-    """"RTX 5080 alone + drafter on RTX 5060 Ti, KV 8-bit, 32k[, no vision]"."""
+    """"RTX 5080 alone, 44 layers, 12 threads, + drafter, KV 8-bit, 32k[, no vision]"."""
     mode = s.get("split-mode")
     if mode == "none" and s.get("device"):
         where = f"{_gpu_name(gpus, s['device'])} alone"
@@ -384,7 +426,20 @@ def label(s, gpus, novision=False):
         where += f" on {_gpu_name(gpus, draft_dev)}" if draft_dev else ""
     elif s.get("spec-type") == "draft-mtp":
         where += " + MTP"
-    parts = [where, _kv_words(s.get("cache-type-k"), s.get("cache-type-v"))]
+    parts = [where]
+    # n-gpu-layers
+    ngl = s.get("n-gpu-layers") or s.get("gpu-layers")
+    if ngl is not None:
+        if ngl == 999 or ngl == "999":
+            parts.append("full offload")
+        else:
+            parts.append(f"{ngl} layers")
+    # threads
+    t = s.get("threads")
+    if t is not None:
+        parts.append(f"{t} threads")
+    # KV type
+    parts.append(_kv_words(s.get("cache-type-k"), s.get("cache-type-v")))
     ctx = int(s.get("ctx-size") or 0)
     if ctx:
         parts.append(f"{ctx // 1024}k")

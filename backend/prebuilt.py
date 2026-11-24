@@ -17,6 +17,9 @@ thread composes them. Pure stdlib.
 import hashlib, json, os, re, shutil, stat, subprocess, tarfile, threading, time
 import urllib.request, zipfile
 
+MOE_CACHE_SCRIPT = "moe-cache-tune.py"
+MOE_CACHE_SCRIPT_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/scripts/moe-cache-tune.py"
+
 import logfiles, osplat
 
 API = "https://api.github.com/repos/ggml-org/llama.cpp"
@@ -491,6 +494,8 @@ class Installer:
                                "sha256": pick["bin"].get("digest", ""),
                                "published": rel["published"],
                                "installed_at": time.time()}, f, indent=1)
+                # Download MoE cache tuning script
+                download_moe_cache_script(partial, log=self._log)
                 shutil.rmtree(final, ignore_errors=True)
                 os.replace(partial, final)
                 sbin = find_server_bin(final)
@@ -513,6 +518,37 @@ class Installer:
                 if n.endswith(".partial"):
                     shutil.rmtree(os.path.join(self.engines, n), ignore_errors=True)
             self.state.update(running=False, finished=time.time())
+
+
+def download_moe_cache_script(install_dir, log=None):
+    """Download the MoE cache tuning script from llama.cpp GitHub.
+
+    Returns the path to the downloaded script, or None on failure.
+    """
+    scripts_dir = os.path.join(install_dir, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    script_path = os.path.join(scripts_dir, MOE_CACHE_SCRIPT)
+
+    # Already downloaded
+    if os.path.isfile(script_path):
+        return script_path
+
+    if log:
+        log(f"downloading {MOE_CACHE_SCRIPT} from {MOE_CACHE_SCRIPT_URL}")
+
+    try:
+        req = urllib.request.Request(MOE_CACHE_SCRIPT_URL, headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(content.decode("utf-8"))
+        if log:
+            log(f"downloaded {MOE_CACHE_SCRIPT} ({len(content)} bytes)")
+        return script_path
+    except Exception as e:
+        if log:
+            log(f"failed to download {MOE_CACHE_SCRIPT}: {e}")
+        return None
 
 
 def _detect():

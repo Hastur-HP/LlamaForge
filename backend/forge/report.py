@@ -50,8 +50,18 @@ def summary(state, running):
         r["finalist"] = r["id"] in state.get("finalists", [])
         san = state.get("sanity", {}).get(r["id"])
         r["sanity"] = san
+    candidates_tested = state.get("candidates_tested", 0)
+    elapsed = state.get("elapsed_seconds")
+    est_remaining = None
+    if candidates_tested > 0 and elapsed and running:
+        avg_per_candidate = elapsed / candidates_tested
+        remaining_candidates = max(0, len(labels) - done)
+        est_remaining = avg_per_candidate * remaining_candidates
     return {"stage": state.get("stage"), "running": running,
-            "progress": {"done": min(done, len(labels)), "total": len(labels)},
+            "progress": {"done": min(done, len(labels)), "total": len(labels),
+                         "candidates_tested": candidates_tested},
+            "elapsed_seconds": elapsed,
+            "estimated_remaining": est_remaining,
             "loading": labels.get(state.get("current")) if state.get("current") else None,
             "leaderboard": board,
             "failed": [{"id": i, "label": labels.get(i, i), "reason": why}

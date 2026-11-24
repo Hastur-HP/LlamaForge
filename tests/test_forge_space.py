@@ -21,6 +21,7 @@ FULL = [
     item("spec-draft-n-max", ["--spec-draft-n-max"], "int"),
     item("ubatch-size", ["-ub", "--ubatch-size"], "int"),
     item("batch-size", ["-b", "--batch-size"], "int"),
+    item("threads", ["-t", "--threads"], "int"),
     item("fit", ["-fit", "--fit"], "enum", ["on", "off"]),
 ]
 OLD = [  # an older build: no tensor mode, old draft spellings, no spec-type
@@ -58,22 +59,33 @@ class Placements(unittest.TestCase):
 
     def test_single_gpu_is_full_offload(self):
         ps = space.placements(GPU16[:1], space.caps_from_items(FULL))
-        self.assertEqual(len(ps), 1)
-        self.assertEqual(ps[0]["devices"], [0])
+        # Now generates multiple n-gpu-layers values for granular offload search
+        self.assertEqual(len(ps), 10)
+        self.assertEqual([p["devices"] for p in ps], [[0]] * 10)
+        self.assertEqual([p["settings"]["n-gpu-layers"] for p in ps],
+                         ["999", "500", "250", "150", "100", "75", "50", "25", "10", "0"])
 
     def test_two_gpus_solo_each_and_splits_per_mode(self):
         ps = space.placements(GPU16, space.caps_from_items(FULL), steps=(0, 4))
         solos = [p for p in ps if p["settings"].get("split-mode") == "none"]
-        self.assertEqual([p["settings"]["device"] for p in solos], ["CUDA0", "CUDA1"])
+        # 2 GPUs x 10 n-gpu-layers values = 20 solo placements
+        self.assertEqual(len(solos), 20)
+        self.assertEqual(sorted([p["settings"]["device"] for p in solos]),
+                         ["CUDA0"] * 10 + ["CUDA1"] * 10)
         splits = {(p["settings"]["split-mode"], p["settings"]["tensor-split"]) for p in ps
                   if p["settings"].get("split-mode") in ("layer", "tensor")}
         self.assertEqual(splits, {("layer", "16,16"), ("layer", "20,12"),
                                   ("tensor", "16,16"), ("tensor", "20,12")})
+        # Each split has 10 n-gpu-layers variants
+        self.assertEqual(len([p for p in ps if "tensor-split" in p["settings"]]), 40)
 
     def test_split_ratios_follow_vram_and_clamp(self):
         gpus = [{"index": 0, "name": "a", "vram_mib": 24000}, {"index": 1, "name": "b", "vram_mib": 8000}]
         ps = space.placements(gpus, space.caps_from_items(OLD), steps=(0, 8))
-        ratios = sorted(p["settings"]["tensor-split"] for p in ps if "tensor-split" in p["settings"])
+        splits = [p for p in ps if "tensor-split" in p["settings"]]
+        # 2 ratios x 10 n-gpu-layers values = 20 placements
+        self.assertEqual(len(splits), 20)
+        ratios = sorted(set(p["settings"]["tensor-split"] for p in splits))
         self.assertEqual(ratios, ["24,8", "30,2"])  # 32 would leave GPU1 nothing: clamped
 
     def test_no_device_flag_means_no_solo(self):
@@ -87,6 +99,44 @@ INV = {"gpus": GPU16, "caps": space.caps_from_items(FULL),
                 "ctx-size": "8192", "temp": "0.7", "tensor-split": "1,1"},
        "drafters": [{"path": "/m/dflash.gguf", "kind": "dflash", "mib": 1800}],
        "mtp": False}
+
+
+class ThreadOptions(unittest.TestCase):
+    def test_generates_reasonable_thread_counts(self):
+        caps = space.caps_from_items(FULL)
+        threads = space._thread_options(caps)
+        # Should have multiple values
+        self.assertGreater(len(threads), 1)
+        # All should be in reasonable range
+        for t in threads:
+            self.assertGreaterEqual(t, 1)
+            self.assertLessEqual(t, 64)
+        # Should include core count
+        import os
+        cores = os.cpu_count() or 4
+        self.assertIn(cores, threads)
+
+    def test_no_thread_flag_returns_none(self):
+        caps = space.caps_from_items(OLD)
+        threads = space._thread_options(caps)
+        self.assertEqual(threads, [None])
+
+    def test_candidates_include_thread_variants(self):
+        r = {"intent": "coding", "ctx": 32768, "allow_loss": False, "time": "quick"}
+        cs = space.candidates(INV, r, drafters=False)
+        # Should have multiple thread values represented
+        thread_values = set()
+        for c in cs:
+            if "threads" in c["settings"]:
+                thread_values.add(c["settings"]["threads"])
+        self.assertGreater(len(thread_values), 1)
+
+    def test_thread_values_are_strings(self):
+        r = {"intent": "coding", "ctx": 32768, "allow_loss": False, "time": "quick"}
+        cs = space.candidates(INV, r, drafters=False)
+        for c in cs:
+            if "threads" in c["settings"]:
+                self.assertIsInstance(c["settings"]["threads"], str)
 
 
 class Candidates(unittest.TestCase):
@@ -117,7 +167,13 @@ class Candidates(unittest.TestCase):
     def test_drafter_on_each_gpu_with_build_spellings(self):
         cs = [c for c in self.cands() if "spec-draft-model" in c["settings"]]
         solo0 = [c for c in cs if c["settings"].get("device") == "CUDA0"]
-        self.assertEqual(sorted(c["settings"]["spec-draft-device"] for c in solo0), ["CUDA0", "CUDA1"])
+        # 10 n-gpu-layers values x 2 draft devices x N thread options
+        # Verify structure rather than exact count (thread count varies by CPU)
+        self.assertGreater(len(solo0), 0)
+        # Should have both draft devices represented
+        draft_devices = set(c["settings"]["spec-draft-device"] for c in solo0)
+        self.assertEqual(draft_devices, {"CUDA0", "CUDA1"})
+        # Verify settings are correct
         c = solo0[0]["settings"]
         self.assertEqual(c["spec-type"], "draft-dflash")
         self.assertEqual(c["spec-draft-ngl"], "99")

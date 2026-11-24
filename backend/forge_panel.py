@@ -7,6 +7,8 @@ post_unload_all, _apply_knobs_and_reload, ApiError, Req, SLOTS, LOGDIR.
 import contextlib
 import json
 import os
+import re
+import subprocess
 import time
 import urllib.request
 
@@ -275,6 +277,111 @@ class Panel:
         self._write(mid, st)
         return 200, {"ok": True}
 
+    def _find_moe_script(self):
+        """Find the moe-cache-tune.py script in the current installation."""
+        import prebuilt
+        c = config.load()
+        sbin = self._d._active_server_bin(c)
+        # Find the installation directory for the active binary
+        installs = prebuilt.list_installs(os.path.join(os.environ.get("HOME", "/tmp"), "Github", "LlamaForge", "engines", "llama.cpp"), active_bin=sbin)
+        install_dir = None
+        for inst in installs:
+            if inst.get("active") or inst.get("server_bin") == sbin:
+                install_dir = inst["dir"]
+                break
+        if not install_dir and installs:
+            install_dir = installs[0]["dir"]
+        if not install_dir:
+            return None
+        script = os.path.join(install_dir, "scripts", "moe-cache-tune.py")
+        if os.path.isfile(script):
+            return script
+        # Try to download it
+        return prebuilt.download_moe_cache_script(install_dir)
+
+    def post_moe_tune(self, req):
+        """Run the MoE cache tuning script for a model.
+
+        Returns the recommended --moe-cache-mib and --moe-cache-cpu-share settings.
+        """
+        b = req.body or {}
+        mid = b.get("model") or ""
+        if self.runner.running():
+            raise self._d.ApiError(409, "a Forge run is already going")
+
+        script = self._find_moe_script()
+        if not script or not os.path.isfile(script):
+            raise self._d.ApiError(400, "moe-cache-tune.py script not found")
+
+        settings = self._settings(mid)
+        model_path = settings.get("model", "")
+        if not model_path or not os.path.isfile(model_path):
+            raise self._d.ApiError(400, f"model not found: {model_path}")
+
+        # Check if the model is an MoE model (has expert tensors)
+        layout = gguf.layout(model_path)
+        if not layout:
+            raise self._d.ApiError(400, "could not read model layout")
+        # MoE models have tensors matching .ffn_(up|down|gate|gate_up)_(ch|)exps
+        import re
+        exps_re = re.compile(r"\.ffn_(up|down|gate|gate_up)_(ch|)exps")
+        is_moe = any(exps_re.search(t[0]) for t in layout.get("tensors", []))
+        if not is_moe:
+            raise self._d.ApiError(400, "model is not an MoE model")
+
+        # Build the llama-server command with -cmoe
+        c = config.load()
+        sbin = self._d._active_server_bin(c)
+        items = self._d.SLOTS.help_items(sbin)
+        if not items:
+            raise self._d.ApiError(400, f"couldn't read the arguments of {sbin}")
+
+        # Use the current settings but add -cmoe
+        tune_settings = dict(settings)
+        tune_settings["cmoe"] = "true"
+
+        try:
+            argv, _dropped = slotproc.argv_for(sbin, "moe-tune", tune_settings, items, items)
+        except ValueError as e:
+            raise self._d.ApiError(400, str(e))
+
+        # Run the tuning script
+        out_dir = os.path.join(self.dir, "moe-tune")
+        os.makedirs(out_dir, exist_ok=True)
+
+        cmd = ["python3", script, "--out", out_dir, "--"] + argv
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            raise self._d.ApiError(500, "MoE cache tuning timed out")
+
+        if result.returncode != 0:
+            raise self._d.ApiError(500, f"MoE cache tuning failed: {result.stderr[:500]}")
+
+        # Parse the recommendation from output
+        output = result.stdout
+        match = re.search(r"recommended:.*?--moe-cache-mib\s+(\d+)\s+--moe-cache-cpu-share\s+([\d.]+)", output)
+        if not match:
+            # Try to find the recommendation in a different format
+            match = re.search(r"--moe-cache-mib\s+(\d+)\s+--moe-cache-cpu-share\s+([\d.]+)", output)
+
+        if match:
+            mib = int(match.group(1))
+            share = float(match.group(2))
+            return 200, {
+                "ok": True,
+                "moe_cache_mib": mib,
+                "moe_cache_cpu_share": share,
+                "output": output[-2000:]  # Last 2KB of output
+            }
+        else:
+            return 200, {
+                "ok": False,
+                "message": "Could not parse recommendation from output",
+                "output": output[-2000:]
+            }
+
     def register(self, get_routes, post_routes):
         get_routes["/api/forge/status"] = self.get_status
         get_routes["/api/forge/share"] = self.get_share
@@ -282,3 +389,4 @@ class Panel:
         post_routes["/api/forge/cancel"] = self.post_cancel
         post_routes["/api/forge/apply"] = self.post_apply
         post_routes["/api/forge/undo"] = self.post_undo
+        post_routes["/api/forge/moe-tune"] = self.post_moe_tune
