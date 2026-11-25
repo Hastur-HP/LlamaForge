@@ -33,6 +33,7 @@ _FLAGS = {
     "draft_n_max": ("--spec-draft-n-max", "--draft-max", "--draft-n-max"),
     "ubatch": ("--ubatch-size",),
     "batch": ("--batch-size",),
+    "flash_attn": ("--flash-attn",),
     "threads": ("--threads",),
     "kv_offload": ("--kv-offload",),
 }
@@ -111,7 +112,28 @@ def _ratio(vrams, off):
     return ",".join(str(max(round(v / 1024), 1)) for v in vrams)
 
 
-def placements(gpus, caps, steps=STEPS_QUICK):
+def _ngl_candidates(n_layers):
+    """Generate n-gpu-layers candidates scaled to model layer count."""
+    if n_layers is None or n_layers <= 0:
+        # Fallback to fixed values if layer count unknown
+        return [999, 500, 250, 150, 100, 75, 50, 25, 10, 0]
+
+    # Test key percentages: 0%, 10%, 25%, 50%, 75%, 90%, 100%
+    values = set()
+    values.add(0)
+    values.add(999)  # "all"
+    for pct in [0.1, 0.25, 0.5, 0.75, 0.9]:
+        values.add(max(1, int(n_layers * pct)))
+
+    # Also include a few fixed values for compatibility
+    for n in [25, 50, 100]:
+        if n <= n_layers:
+            values.add(n)
+
+    return sorted(values, reverse=True)
+
+
+def placements(gpus, caps, steps=STEPS_QUICK, n_layers=None):
     """[{name, settings, devices}] - where the weights go. Tries full offload first,
     then progressively less GPU offload so models that don't fit entirely can still
     run with partial CPU offload."""
@@ -119,10 +141,9 @@ def placements(gpus, caps, steps=STEPS_QUICK):
         return []
     k = caps["keys"]
     ngl_key = k["ngl"] or "n-gpu-layers"
-    # Try full offload, then progressively less GPU offload so models that don't
-    # fit entirely can still run with partial CPU offload. Granular low values
-    # catch optimal offload points like 44 layers (between 50 and 25).
-    ngl_values = ["999", "500", "250", "150", "100", "75", "50", "25", "10", "0"]
+    # Model-aware n-gpu-layers: scale candidates to the actual layer count so
+    # small models (e.g. 32 layers) aren't tested at 500 layers.
+    ngl_values = [str(n) for n in _ngl_candidates(n_layers)]
     if len(gpus) == 1:
         out = []
         for ngl in ngl_values:
@@ -217,6 +238,30 @@ def _vision_options(base, drop):
     return out
 
 
+def _batch_options(caps):
+    """[(ubatch, batch)] - batch size candidates."""
+    k = caps["keys"]
+    if not k["ubatch"]:
+        return [(None, None)]
+
+    # Test different batch sizes for throughput optimization
+    candidates = [
+        (512, 2048),   # Default
+        (1024, 2048),  # Higher throughput
+        (2048, 4096),  # Maximum throughput
+    ]
+    return candidates
+
+
+def _flash_attn_options(caps):
+    """[(flash_attn)] - flash attention candidates."""
+    k = caps["keys"]
+    if not k["flash_attn"]:
+        return [None]
+    # Test auto (default), on, and off
+    return ["auto", "on", "off"]
+
+
 def _thread_options(caps):
     """[(threads)] - thread count candidates based on CPU core count.
     Uses physical core count and explores half, equal, and double for
@@ -254,25 +299,35 @@ def candidates(inv, req, drafters=True):
     steps = STEPS_THOROUGH if req.get("time") == "thorough" else STEPS_QUICK
     out = []
     threads = _thread_options(caps)
+    batch_opts = _batch_options(caps)
+    flash_opts = _flash_attn_options(caps)
     for vbase, novision in _vision_options(base, req.get("drop_vision")):
         for p in placements(inv.get("gpus") or [], caps, steps):
             for kind, dset in (_drafter_options(inv, caps) if drafters else [(None, {})]):
                 for ck, cv, lossy in _kv_options(inv.get("base") or {}, caps, req.get("allow_loss")):
-                    for t in threads:
-                        s = dict(vbase)
-                        s.update(p["settings"])
-                        s["ctx-size"] = str(req["ctx"])
-                        if k["fit"]:
-                            s[k["fit"]] = "off"     # a silent fit-down would fake a pass
-                        s[k["ctk"] or "cache-type-k"] = ck
-                        s[k["ctv"] or "cache-type-v"] = cv
-                        if t is not None:
-                            s[k["threads"]] = str(t)
-                        s.update(dset)
-                        out.append({"id": _cid(s), "label": label(s, inv.get("gpus") or [], novision),
-                                    "settings": s, "lossy": lossy, "novision": novision,
-                                    "ctx": int(req["ctx"]), "devices": p["devices"], "spec": kind,
-                                    "parts": len(p["devices"]) + (1 if kind else 0)})
+                    for ub, b in batch_opts:
+                        for fa in flash_opts:
+                            for t in threads:
+                                s = dict(vbase)
+                                s.update(p["settings"])
+                                s["ctx-size"] = str(req["ctx"])
+                                if k["fit"]:
+                                    s[k["fit"]] = "off"     # a silent fit-down would fake a pass
+                                s[k["ctk"] or "cache-type-k"] = ck
+                                s[k["ctv"] or "cache-type-v"] = cv
+                                if ub is not None:
+                                    s[k["ubatch"]] = str(ub)
+                                if b is not None:
+                                    s[k["batch"]] = str(b)
+                                if fa is not None:
+                                    s[k["flash_attn"]] = fa
+                                if t is not None:
+                                    s[k["threads"]] = str(t)
+                                s.update(dset)
+                                out.append({"id": _cid(s), "label": label(s, inv.get("gpus") or [], novision),
+                                            "settings": s, "lossy": lossy, "novision": novision,
+                                            "ctx": int(req["ctx"]), "devices": p["devices"], "spec": kind,
+                                            "parts": len(p["devices"]) + (1 if kind else 0)})
     return out
 
 

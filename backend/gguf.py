@@ -114,6 +114,35 @@ def context_length(path):
         return None
 
 
+def layer_count(path):
+    """Number of transformer blocks from a GGUF file, or None if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            if _rd(f, 4) != b"GGUF":
+                return None
+            if _u32(f) < 2:
+                return None
+            _u64(f)                       # tensor count (unused)
+            n_kv = _u64(f)
+            if n_kv > 1_000_000:
+                return None
+            arch, blocks = None, {}
+            for _ in range(n_kv):
+                key = _read_str(f)
+                vt  = _u32(f)
+                if key == "general.architecture" and vt == _STRING:
+                    arch = _read_str(f)
+                elif key.endswith(".block_count") and vt in _INT_TYPES:
+                    blocks[key] = int(_read_scalar(f, vt))
+                else:
+                    _skip_value(f, vt)
+            if arch and f"{arch}.block_count" in blocks:
+                return blocks[f"{arch}.block_count"]
+            return next(iter(blocks.values())) if blocks else None
+    except Exception:
+        return None
+
+
 def has_nextn(path):
     """True if this GGUF declares MTP/NextN layers (`*.nextn_predict_layers` > 0).
 
