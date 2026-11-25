@@ -1882,7 +1882,6 @@ def post_model_unregister(req):
 def post_model_rename(req):
     """Rename a model's ID (section name in models.ini). If the model is loaded,
     it is unloaded first, then reloaded with the new ID."""
-    print(f"[rename] request body: {req.body}")
     old_id = req.body.get("model", "")
     new_id = req.body.get("new_id", "")
     if not old_id or not isinstance(old_id, str) or old_id == "*":

@@ -308,9 +308,7 @@ class H(BaseHTTPRequestHandler):
 
         handler = routes.POST_ROUTES.get(p) or _prefix(routes.POST_PREFIX_ROUTES, p)
         if not handler:
-            print(f"[server] POST {p} not found in routes")
             return self._send(404, {"error": "not found"})
-        print(f"[server] POST {p} -> {handler.__name__}")
         return self._run(handler, Req(body=body, headers=headers, path=p))
 
     def do_DELETE(self):
