@@ -435,6 +435,26 @@ def _remove_section_locked(section, path):
     _write(path, lines)
     return True
 
+def rename_section(old_name, new_name, path=None):
+    """Rename a section header, preserving its body and all other sections.
+    Returns True if the section was renamed, False if it wasn't found."""
+    path = path or ini_path()
+    with _INI_LOCK:
+        return _rename_section_locked(old_name, new_name, path)
+
+def _rename_section_locked(old_name, new_name, path):
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8-sig") as f:
+        lines = f.read().split("\n")
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*\[(.+?)\]", line)
+        if m and m.group(1) == old_name:
+            lines[i] = f"[{new_name}]"
+            _write(path, lines)
+            return True
+    return False
+
 # ---------------- knob presets ----------------
 
 def get_presets():

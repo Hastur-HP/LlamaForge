@@ -1879,6 +1879,67 @@ def post_model_unregister(req):
     return 200, {"ok": True, "backend": backend.name}
 
 
+def post_model_rename(req):
+    """Rename a model's ID (section name in models.ini). If the model is loaded,
+    it is unloaded first, then reloaded with the new ID."""
+    print(f"[rename] request body: {req.body}")
+    old_id = req.body.get("model", "")
+    new_id = req.body.get("new_id", "")
+    if not old_id or not isinstance(old_id, str) or old_id == "*":
+        raise ApiError(400, "a model id is required")
+    if not new_id or not isinstance(new_id, str) or new_id == "*":
+        raise ApiError(400, "a new id is required")
+    if old_id == new_id:
+        raise ApiError(400, "old and new id must differ")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", new_id):
+        raise ApiError(400, "new id must be alphanumeric, hyphens, underscores, or dots")
+
+    mid, backend = _backend_for(req)
+    path = config.ini_path(backend.name)
+
+    # Check that old section exists
+    sections = config.read_sections(path)
+    if old_id not in sections:
+        raise ApiError(404, "model is not registered")
+    # Check that new section doesn't already exist
+    if new_id in sections:
+        raise ApiError(409, f"model id '{new_id}' already exists")
+
+    # If loaded, unload first
+    status, data = router("/models")
+    loaded = any(
+        m.get("id") == old_id and (m.get("status") or {}).get("value") == "loaded"
+        for m in data.get("data", []) if status == 200
+    )
+    if loaded:
+        unload_status, unload_out = router("/models/unload", "POST", {"model": old_id})
+        if unload_status != 200:
+            detail = (unload_out or {}).get("error", "router refused to unload it")
+            raise ApiError(409, f"model is still loading or could not be unloaded: {detail}")
+
+    # Rename the section
+    if not config.rename_section(old_id, new_id, path):
+        raise ApiError(409, "model registry changed; reload and try again")
+
+    # Clean up old bindings
+    _reconcile_preset_binding(old_id, {}, backend.name)
+    config.prune_binding(old_id, backend.name)
+    config.prune_vision(old_id, backend.name)
+    reload_presets()
+
+    # Reload with new ID if it was loaded
+    if loaded:
+        load_status, load_out = router("/models/load", "POST", {"model": new_id})
+        if load_status != 200:
+            detail = (load_out or {}).get("error", "router failed to reload it")
+            return 200, {"ok": True, "backend": backend.name, "old_id": old_id, "new_id": new_id,
+                         "reloaded": False, "error": detail}
+        return 200, {"ok": True, "backend": backend.name, "old_id": old_id, "new_id": new_id,
+                     "reloaded": True}
+
+    return 200, {"ok": True, "backend": backend.name, "old_id": old_id, "new_id": new_id}
+
+
 # ---- llama.cpp aliases (kept: this is what the dashboard calls today) -------
 
 def post_save(req):
@@ -3488,6 +3549,7 @@ POST_ROUTES = {
     "/api/model/xray/apply":    post_model_xray_apply,
     "/api/models/delete":       post_model_delete,
     "/api/models/unregister":   post_model_unregister,
+    "/api/models/rename":       post_model_rename,
     # llama.cpp-specific aliases
     "/api/save":                post_save,
     "/api/model/vision":        post_model_vision,

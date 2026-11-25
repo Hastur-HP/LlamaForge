@@ -156,6 +156,7 @@ function editorButtons(m) {
       ${isUp(m)?`<button class="ghost" data-act="claude" title="open Claude Code on a folder, running on this model">Claude Code</button>`:""}
       <button class="ghost" data-act="client">Client config</button>
       <button class="ghost" data-act="profile" title="save a one-click launch: model + preset + engine build">Save as profile</button>
+      <button class="ghost" data-act="rename" title="change this model's ID (section name in models.ini)">Rename</button>
       <button class="danger" data-act="unregister" title="remove from models.ini; does not delete the GGUF">Unregister</button>`;
 }
 function editorNote(m) {
@@ -1237,6 +1238,18 @@ export function initModels() {
         await api("/api/unload", {model: id}); toast("Unloaded", "ok");
       } else if (act === "client") {
         await clientOpening; return;
+      } else if (act === "rename") {
+        const newId = await askText("New model ID", {title: `Rename ${id}`, value: id, placeholder: "alphanumeric, hyphens, underscores, dots"});
+        if (!newId || newId === id) { btn.disabled = false; return; }
+        msg.className = "msg work"; msg.textContent = `renaming to ${newId}...`;
+        const r = await api("/api/models/rename", {model: id, new_id: newId, backend: beOf(id)});
+        if (r.ok) {
+          toast(`Renamed to ${r.new_id}`, "ok");
+          setOpenId(null);
+        } else {
+          msg.className = "msg err";
+          msg.textContent = r.error || "rename failed";
+        }
       } else if (act === "unregister") {
         if (!(await askYes("Its GGUF file stays on disk.", {title: `Unregister ${id}`, ok: "Unregister", danger: true}))) { btn.disabled = false; return; }
         msg.className = "msg work"; msg.textContent = "removing from models.ini...";
